@@ -1,4 +1,4 @@
-import { Component, ElementRef, output, signal, viewChild, ViewChild, effect, OnInit, OnDestroy, inject } from '@angular/core';
+import { Component, ElementRef, output, signal, viewChild, effect, OnInit, OnDestroy, inject } from '@angular/core';
 import { Subject, switchMap, takeUntil, map, from } from 'rxjs';
 import { NgFor, NgIf } from '@angular/common';
 import { AudioItem, AudioService } from '../services/audio.service';
@@ -70,8 +70,7 @@ export class AudioPlayerComponent {
   // Cleanup subject
   private destroy$ = new Subject<void>();
 
-  @ViewChild('trackListContainer')
-  private readonly trackListContainer!: ElementRef;
+  private readonly trackListContainer = viewChild.required<ElementRef>('trackListContainer');
 
   ngOnInit(): void {
     this.initializeAudio();
@@ -108,7 +107,7 @@ export class AudioPlayerComponent {
     }
   }
   scrollToCurrentTrack() {
-    const container = this.trackListContainer.nativeElement;
+    const container = this.trackListContainer().nativeElement;
     const selectedTrack = container.children[this.currentTrackIndex()];
     if (selectedTrack) {
       selectedTrack.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
