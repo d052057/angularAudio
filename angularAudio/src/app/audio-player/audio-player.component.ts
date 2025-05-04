@@ -431,15 +431,32 @@ export class AudioPlayerComponent {
     const list = this.audioList(); // Cache the value
     return !list || list.length === 0;
   }
+  //private getAudioDuration(src: string): Promise<number> {
+  //  return new Promise(resolve => {
+  //    const audio = new Audio();
+
+  //    const onLoadedMetadata = () => {
+  //      this.eventListenerService.unregisterHandlers(this.audio); // cleanup after use
+  //      resolve(Math.floor(audio.duration));
+  //    };
+
+  //    this.eventListenerService.registerHandler(this.audio, 'loadedmetadata', onLoadedMetadata);
+  //    audio.src = src;
+  //  });
+  //}
   private getAudioDuration(src: string): Promise<number> {
+    const audioTmp = new Audio();
+
     return new Promise(resolve => {
-      const audio = new Audio();
-      audio.addEventListener('loadedmetadata', () => {
-        resolve(Math.floor(audio.duration));
-      });
-      audio.src = src;
+      const onMetadata = () => {
+        resolve(Math.floor(audioTmp.duration));
+      };
+
+      this.eventListenerService.registerHandler(audioTmp, 'loadedmetadata', onMetadata);
+      audioTmp.src = src;
     });
   }
+
   getVideoDuration(src: string, obj: any) {
     return new Promise(function (resolve) {
       var video = document.createElement('video');
