@@ -1,23 +1,19 @@
-import { Component, ElementRef, output, signal, viewChild, input, effect, OnInit, OnDestroy } from '@angular/core';
-import { Subject, takeUntil } from 'rxjs';
+import { Component, ElementRef, output, signal, viewChild, ViewChild, effect, OnInit, OnDestroy, inject } from '@angular/core';
+import { Subject, switchMap, takeUntil, map, from } from 'rxjs';
 import { NgFor, NgIf } from '@angular/common';
-export interface AudioItem {
-  url: string;
-  title?: string;
-}
-
+import { AudioItem, AudioService } from '../services/audio.service';
+import { TimeConversionPipe } from '../pipes/time-conversion.pipe';
+import { EventListenerService } from '../services/event-handler.service';
 @Component({
   selector: 'app-audio-player',
-  imports: [NgFor, NgIf],
+  imports: [NgFor, NgIf, TimeConversionPipe],
   templateUrl: './audio-player.component.html',
   styleUrl: './audio-player.component.scss'
 })
 export class AudioPlayerComponent {
-  list: AudioItem[] = [
-    { url: '/assets/Train.mp3', title: 'ac dc train' },
-    { url: '/assets/Fire.mp3', title: 'Fire' }
-  ];
-  audioList = input<AudioItem[]>(this.list);
+  service = inject(AudioService);
+  eventListenerService = inject(EventListenerService);
+  audioList = signal<AudioItem[]>([]);
   // In your component class
   isShuffle = signal(false); // Initialize shuffle state to false
 
@@ -35,12 +31,14 @@ export class AudioPlayerComponent {
     }
   }
   // Input properties
-  /*audioList = input.required<AudioItem[]>();*/
-  audioVolume = input<number>(50); // Default volume 50%
-  autoPlay = input(true);
+
+  autoPlay = signal(true);
 
 
   // Output properties
+  audioTimeUpdate = output<number>();
+  audioTimeUpdateChange = output<number>();
+  audioVolume = signal<number>(50); // Default volume 50%
   audioVolumeChange = output<number>();
   playEvent = output<void>();
   pauseEvent = output<void>();
@@ -63,75 +61,59 @@ export class AudioPlayerComponent {
 
   // ViewChild reference
   readonly audioPlayer = viewChild.required<ElementRef<HTMLAudioElement>>('AngAudioPlayer');
-
+  audio!: any;
+  /*private readonly audioContext = new AudioContext();*/
   // Shuffle-related properties
   private shuffledIndices: number[] = []; // Added missing property
   private playHistory: number[] = []; // Added missing property
 
   // Cleanup subject
   private destroy$ = new Subject<void>();
-  constructor() {
-    effect(() => {
-      if (this.audioPlayer()) {
-        this.audioPlayer().nativeElement.volume = this.audioVolume() / 100;
-      }
-    });
 
-    effect(() => {
-      if (this.audioList()?.length) {
-        this.currentTrackIndex.set(0);
-        this.currentAudio.set(this.audioList()[0]);
-        this.isAudioLoaded.set(false);
-      } else {
-        this.currentAudio.set(null);
-      }
-    });
+  @ViewChild('trackListContainer')
+  private readonly trackListContainer!: ElementRef;
 
-    effect(() => {
-      const audioList = this.audioList();
-      if (audioList?.length && this.currentTrackIndex() < audioList.length) {
-        this.currentAudio.set(audioList[this.currentTrackIndex()]);
-        this.trackChangeEvent.emit(audioList[this.currentTrackIndex()]);
-      }
-    });
-
-    effect(() => {
-      this.isAudioAutoPlay.set(this.autoPlay());
-      if (this.autoPlay() && this.currentAudio() && this.audioPlayer()) {
-        this.attemptAutoplay();
-      }
-    });
-
-    // Added effect for shuffle mode changes
-    effect(() => {
-      if (this.isShuffle()) {
-        this.generateShuffleIndices();
-      } else {
-        this.playHistory = [this.currentTrackIndex()];
-      }
-    });
-  }
   ngOnInit(): void {
     this.initializeAudio();
-
-    
+    this.audio = this.audioPlayer().nativeElement;
+    this.service.getAudio()
+      .pipe(
+        takeUntil(this.destroy$),
+        switchMap((audioList: AudioItem[]) => {
+          const durationPromises = audioList.map(async (item: AudioItem) => {
+            item.duration = await this.getAudioDuration(item.url);
+            return item;
+          });
+          return from(Promise.all(durationPromises));
+        })
+      )
+      .subscribe((data: AudioItem[]) => {
+        this.audioList.set(data);
+        this.currentTrackIndex.set(0);
+        this.currentAudio.set(data[this.currentTrackIndex()]);
+        this.isAudioLoaded.set(false);
+      });
   }
+  constructor() {
+  }
+
 
   ngOnDestroy(): void {
     this.destroy$.next();
     this.destroy$.complete();
 
     if (this.audioPlayer()) {
-      const audio = this.audioPlayer().nativeElement;
-      audio.removeEventListener('playing', this.handlePlaying);
-      audio.removeEventListener('pause', this.handlePause);
-      audio.removeEventListener('loadeddata', this.handleLoadedData);
-      audio.removeEventListener('timeupdate', this.handleTimeUpdate);
-      audio.removeEventListener('ended', this.handleEnded);
-      audio.removeEventListener('volumechange', this.handleVolumeChange);
+      /* const audio = this.audioPlayer().nativeElement;*/
+      this.eventListenerService.unregisterAll();
     }
   }
-
+  scrollToCurrentTrack() {
+    const container = this.trackListContainer.nativeElement;
+    const selectedTrack = container.children[this.currentTrackIndex()];
+    if (selectedTrack) {
+      selectedTrack.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+  }
   private initializeAudio(): void {
     const audioList = this.audioList();
     if (audioList?.length) {
@@ -143,16 +125,16 @@ export class AudioPlayerComponent {
 
     setTimeout(() => {
       if (this.audioPlayer()) {
-        const audio = this.audioPlayer().nativeElement;
-        audio.volume = this.audioVolume() / 100;
+        //const audio = this.audioPlayer().nativeElement;
+        this.audio.volume = this.audioVolume() / 100;
         this.isAudioAutoPlay.set(this.autoPlay());
 
-        audio.addEventListener('playing', this.handlePlaying);
-        audio.addEventListener('pause', this.handlePause);
-        audio.addEventListener('loadeddata', this.handleLoadedData);
-        audio.addEventListener('timeupdate', this.handleTimeUpdate);
-        audio.addEventListener('ended', this.handleEnded);
-        audio.addEventListener('volumechange', this.handleVolumeChange);
+        this.eventListenerService.registerHandler(this.audio, 'playing', this.handlePlaying);
+        this.eventListenerService.registerHandler(this.audio, 'pause', this.handlePause);
+        this.eventListenerService.registerHandler(this.audio, 'loadeddata', this.handleLoadedData);
+        this.eventListenerService.registerHandler(this.audio, 'timeupdate', this.handleTimeUpdate);
+        this.eventListenerService.registerHandler(this.audio, 'ended', this.handleEnded);
+        this.eventListenerService.registerHandler(this.audio, 'volumechange', this.handleVolumeChange);
 
         if (this.autoPlay()) {
           this.attemptAutoplay();
@@ -178,32 +160,34 @@ export class AudioPlayerComponent {
     this.totalAudioLength.set(duration);
   };
 
+  private handleEnded = (): void => {
+    this.trackEndEvent.emit();
+    if (this.isRepeat()) {
+      this.audioPlayer().nativeElement.currentTime = 0;
+      this.audioVolume.set(this.audioPlayer().nativeElement.currentTime)
+      this.play();
+      return;
+    } else {
+      this.playNext();
+    }
+  };
   private handleTimeUpdate = (): void => {
     const currentTime = Math.floor(this.audioPlayer().nativeElement.currentTime);
     this.currentAudioTime.set(currentTime);
-  };
-
-  private handleEnded = (): void => {
-    this.trackEndEvent.emit();
-
-    if (this.isRepeat()) {
-      this.seek(0);
-      this.play();
-      return;
-    }
-
-    this.playNext();
+    this.audioTimeUpdateChange.emit(currentTime);
   };
 
   private handleVolumeChange = (): void => {
     const volume = Math.floor(this.audioPlayer().nativeElement.volume * 100);
     this.audioVolumeChange.emit(volume);
+
   };
 
   // Public API methods
   play(): void {
-    alert(this.currentAudio()?.url)
     if (this.audioPlayer()) {
+      this.handleLoadedData();
+      this.scrollToCurrentTrack();
       this.audioPlayer().nativeElement.play()
         .catch(error => console.error('Error playing audio:', error));
     }
@@ -213,6 +197,7 @@ export class AudioPlayerComponent {
     if (this.audioPlayer()) {
       this.audioPlayer().nativeElement.pause();
     }
+
   }
 
   togglePlay(): void {
@@ -221,18 +206,16 @@ export class AudioPlayerComponent {
 
   toggleMute(): void {
     if (this.audioPlayer()) {
-      const audio = this.audioPlayer().nativeElement;
-      audio.muted = !audio.muted;
-      this.isMute.set(audio.muted);
       this.muteEvent.emit();
+      this.isMute.set(!this.isMute());
+      this.audioPlayer().nativeElement.muted = this.isMute();
     }
   }
 
   toggleRepeat(): void {
     if (this.audioPlayer()) {
-      const audio = this.audioPlayer().nativeElement;
-      audio.loop = !audio.loop;
-      this.isRepeat.set(audio.loop);
+      this.audio.loop = !this.audio.loop;
+      this.isRepeat.set(this.audio.loop);
       this.repeatEvent.emit();
     }
   }
@@ -247,21 +230,21 @@ export class AudioPlayerComponent {
     }
   }
 
-  seek(time: string | number): void {
+  seek(time: Event): void {
     if (this.audioPlayer()) {
-      const timeNumber = typeof time === 'string' ? parseFloat(time) : time;
-      if (!isNaN(timeNumber)) {
-        this.audioPlayer().nativeElement.currentTime = timeNumber;
-      }
+      const input = time.target as HTMLInputElement;
+      const timeNumber = parseFloat(input.value)
+      this.audioPlayer().nativeElement.currentTime = timeNumber;
+      this.currentAudioTime.set(this.audioPlayer().nativeElement.currentTime);
     }
   }
 
-  setVolume(volume: string | number): void {
+  setVolume(volume: Event): void {
     if (this.audioPlayer()) {
-      const volumeNumber = typeof volume === 'string' ? parseFloat(volume) : volume;
-      if (!isNaN(volumeNumber) && volumeNumber >= 0 && volumeNumber <= 100) {
-        this.audioPlayer().nativeElement.volume = volumeNumber / 100;
-      }
+      const input = volume.target as HTMLInputElement;
+      const volumeNumber = parseFloat(input.value);
+      this.audioPlayer().nativeElement.volume = volumeNumber / 100;
+      this.audioVolume.set(this.audioPlayer().nativeElement.volume)
     }
   }
   playNext(): void {
@@ -270,7 +253,13 @@ export class AudioPlayerComponent {
 
     const nextIndex = this.getNextTrackIndex();
     this.currentTrackIndex.set(nextIndex);
-
+    this.audioPlayer().nativeElement.currentTime = 0;
+    this.currentAudioTime.set(this.audioPlayer().nativeElement.currentTime);
+    this.currentAudio.set(audioList[this.currentTrackIndex()]);
+    if (this.audio.muted) {
+      this.audio.muted = !this.audio.muted;
+      this.isMute.set(this.audio.muted);
+    }
     setTimeout(() => {
       if (this.isAudioAutoPlay()) {
         this.play();
@@ -284,6 +273,9 @@ export class AudioPlayerComponent {
 
     const prevIndex = this.getPreviousTrackIndex();
     this.currentTrackIndex.set(prevIndex);
+    this.audioPlayer().nativeElement.currentTime = 0;
+    this.currentAudioTime.set(this.audioPlayer().nativeElement.currentTime);
+    this.currentAudio.set(audioList[this.currentTrackIndex()]);
     setTimeout(() => this.play(), 50);
   }
 
@@ -292,6 +284,7 @@ export class AudioPlayerComponent {
     if (!audioList?.length || index < 0 || index >= audioList.length) return;
 
     this.currentTrackIndex.set(index);
+    this.currentAudio.set(audioList[this.currentTrackIndex()]);
     setTimeout(() => this.play(), 50);
   }
 
@@ -433,14 +426,34 @@ export class AudioPlayerComponent {
   getRemainingShuffleTracks(): number {
     return this.shuffledIndices.length;
   }
-  formatTime(seconds: number): string {
-    if (isNaN(seconds)) return '00:00';
-    const minutes = Math.floor(seconds / 60);
-    const remainingSeconds = Math.floor(seconds % 60);
-    return `${minutes.toString().padStart(2, '0')}:${remainingSeconds.toString().padStart(2, '0')}`;
-  }
+
   get audioListState(): boolean {
     const list = this.audioList(); // Cache the value
     return !list || list.length === 0;
+  }
+  private getAudioDuration(src: string): Promise<number> {
+    return new Promise(resolve => {
+      const audio = new Audio();
+      audio.addEventListener('loadedmetadata', () => {
+        resolve(Math.floor(audio.duration));
+      });
+      audio.src = src;
+    });
+  }
+  getVideoDuration(src: string, obj: any) {
+    return new Promise(function (resolve) {
+      var video = document.createElement('video');
+      video.preload = 'metadata';
+      video.addEventListener('loadedmetadata', () => {
+        var event = new CustomEvent("myVideoDurationEvent", {
+          detail: {
+            duration: video.duration,
+          }
+        });
+        obj['duration'] = Math.floor(video.duration);
+      })
+      video.src = src;
+    }
+    );
   }
 }
