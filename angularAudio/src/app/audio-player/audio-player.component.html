@@ -1,5 +1,5 @@
-<audio controls #AngAudioPlayer [src]="currentAudio()?.url"></audio>
-<div class="container py-3">
+<div class="container py-3" [@fadeInOut]>
+  <audio controls #AngAudioPlayer [src]="currentAudio()?.url"></audio>
   <div class="card shadow-sm">
     <div class="card-body">
       <!-- Track info -->

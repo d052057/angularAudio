@@ -4,11 +4,13 @@ import { NgFor, NgIf } from '@angular/common';
 import { AudioItem, AudioService } from '../services/audio.service';
 import { TimeConversionPipe } from '../pipes/time-conversion.pipe';
 import { EventListenerService } from '../services/event-handler.service';
+import { fadeInOut } from '../services/animations';
 @Component({
   selector: 'app-audio-player',
   imports: [NgFor, NgIf, TimeConversionPipe],
   templateUrl: './audio-player.component.html',
-  styleUrl: './audio-player.component.scss'
+  styleUrl: './audio-player.component.scss',
+  animations: [fadeInOut]
 })
 export class AudioPlayerComponent {
   service = inject(AudioService);
