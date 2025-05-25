@@ -1,10 +1,15 @@
 import { Component, ElementRef, output, signal, viewChild, effect, OnInit, OnDestroy, inject, computed } from '@angular/core';
-import { Subject, switchMap, takeUntil, map, from } from 'rxjs';
+import { Subject, switchMap, takeUntil, map, from, catchError, of } from 'rxjs';
 import { NgFor, NgIf } from '@angular/common';
 import { AudioItem, AudioService } from '../services/audio.service';
 import { TimeConversionPipe } from '../pipes/time-conversion.pipe';
 import { EventListenerService } from '../services/event-handler.service';
 import { fadeInOut } from '../services/animations';
+
+// Types for better type safety
+type AutoplayCapability = 'allowed' | 'muted-only' | 'blocked';
+type PlaybackMode = 'normal' | 'shuffle' | 'repeat';
+
 @Component({
   selector: 'app-audio-player',
   imports: [NgFor, NgIf, TimeConversionPipe],
@@ -13,140 +18,275 @@ import { fadeInOut } from '../services/animations';
   animations: [fadeInOut]
 })
 export class AudioPlayerComponent {
-  service = inject(AudioService);
-  eventListenerService = inject(EventListenerService);
-  audioList = signal<AudioItem[]>([]);
-  // In your component class
-  isShuffle = signal(false); // Initialize shuffle state to false
 
-  // Add this method to your component
-  toggleShuffle(): void {
-    let shuffleState = this.isShuffle();
-    shuffleState = !shuffleState;
-    this.isShuffle.set(shuffleState);
-    // If enabling shuffle, generate the shuffled indices
-    if (this.isShuffle()) {
-      this.generateShuffleIndices();
-    } else {
-      // If disabling shuffle, clear the shuffle history
-      this.playHistory = [this.currentTrackIndex()];
-    }
-  }
-  // Input properties
+  // Injected services
+  private readonly audioService = inject(AudioService);
+  private readonly eventListenerService = inject(EventListenerService);
 
-  autoPlay = signal(true);
+  // Core state signals
+  readonly audioList = signal<AudioItem[]>([]);
+  readonly currentTrackIndex = signal<number>(0);
+  readonly isAudioLoaded = signal<boolean>(false);
+  readonly isAudioPlaying = signal<boolean>(false);
+  readonly totalAudioLength = signal<number>(0);
+  readonly currentAudioTime = signal<number>(0);
+
+  // Player settings signals
+  readonly audioVolume = signal<number>(50);
+  readonly autoPlay = signal<boolean>(true);
+  readonly isShuffle = signal<boolean>(false);
+  readonly isRepeat = signal<boolean>(false);
+  readonly isMute = signal<boolean>(false);
+  readonly isAudioAutoPlay = signal<boolean>(false);
+
+  // Computed values for better performance
+  readonly currentAudio = computed(() => {
+    const list = this.audioList();
+    const index = this.currentTrackIndex();
+    return list[index] || null;
+  });
+
+  readonly audioListState = computed(() => {
+    const list = this.audioList();
+    return !list || list.length === 0;
+  });
 
 
-  // Output properties
-  audioTimeUpdate = output<number>();
-  audioTimeUpdateChange = output<number>();
-  audioVolume = signal<number>(50); // Default volume 50%
-  audioVolumeChange = output<number>();
-  playEvent = output<void>();
-  pauseEvent = output<void>();
-  muteEvent = output<void>();
-  repeatEvent = output<void>();
-  trackEndEvent = output<void>();
-  trackChangeEvent = output<AudioItem>();
-  autoPlayChange = output<boolean>();
+  readonly canPlayNext = computed(() => {
+    const list = this.audioList();
+    return list.length > 1;
+  });
 
-  // Signal-based state
-  isAudioLoaded = signal(false);
-  isAudioPlaying = signal(false);
-  isAudioAutoPlay = signal(false);
-  isRepeat = signal(false);
-  isMute = signal(false);
-  currentTrackIndex = signal(0);
-  currentAudio = signal<AudioItem | null>(null);
-  totalAudioLength = signal(0);
-  currentAudioTime = signal(0);
+  readonly canPlayPrevious = computed(() => {
+    const list = this.audioList();
+    return list.length > 1;
+  });
 
-  // ViewChild reference
-  readonly audioPlayer = viewChild.required<ElementRef<HTMLAudioElement>>('AngAudioPlayer');
-  audio!: any;
-  /*private readonly audioContext = new AudioContext();*/
-  // Shuffle-related properties
-  private shuffledIndices: number[] = []; // Added missing property
-  private playHistory: number[] = []; // Added missing property
+  // Output events
+  readonly audioTimeUpdate = output<number>();
+  readonly audioTimeUpdateChange = output<number>();
+  readonly audioVolumeChange = output<number>();
+  readonly playEvent = output<void>();
+  readonly pauseEvent = output<void>();
+  readonly muteEvent = output<void>();
+  readonly repeatEvent = output<void>();
+  readonly trackEndEvent = output<void>();
+  readonly trackChangeEvent = output<AudioItem>();
+  readonly autoPlayChange = output<boolean>();
 
-  // Cleanup subject
-  private destroy$ = new Subject<void>();
-
+  // ViewChild references
+  private readonly audioPlayer = viewChild.required<ElementRef<HTMLAudioElement>>('AngAudioPlayer');
   private readonly trackListContainer = viewChild.required<ElementRef>('trackListContainer');
 
-  ngOnInit(): void {
-    this.initializeAudio();
-    this.audio = this.audioPlayer().nativeElement;
-    this.service.getAudio()
+  // Private properties
+  private audio!: HTMLAudioElement;
+  private readonly destroy$ = new Subject<void>();
+  private shuffledIndices: number[] = [];
+  private playHistory: number[] = [];
+  private autoplayCapability: AutoplayCapability = 'blocked';
+
+  // Constants
+  private static readonly VOLUME_STEP = 10;
+  private static readonly SEEK_STEP = 15;
+  private static readonly MAX_HISTORY_LENGTH = 50;
+
+
+
+
+  constructor() {
+    // Effects for reactive updates
+    effect(() => {
+      const volume = this.audioVolume();
+      if (this.audio) {
+        this.audio.volume = volume / 100;
+      }
+    });
+
+    effect(() => {
+      const muted = this.isMute();
+      if (this.audio) {
+        this.audio.muted = muted;
+      }
+    });
+
+    effect(() => {
+      const repeat = this.isRepeat();
+      if (this.audio) {
+        this.audio.loop = repeat;
+      }
+    });
+  }
+  async ngOnInit(): Promise<void> {
+    try {
+      await this.initializeComponent();
+    } catch (error) {
+      console.error('Failed to initialize audio player:', error);
+    }
+  }
+
+  ngOnDestroy(): void {
+    this.cleanup();
+  }
+
+  private async initializeComponent(): Promise<void> {
+    await this.loadAudioList();
+    this.initializeAudioElement();
+    await this.checkAutoplayCapability();
+  }
+  private async loadAudioList(): Promise<void> {
+    this.audioService.getAudio()
       .pipe(
         takeUntil(this.destroy$),
-        switchMap((audioList: AudioItem[]) => {
-          const durationPromises = audioList.map(async (item: AudioItem) => {
-            item.duration = await this.getAudioDuration(item.url);
-            return item;
-          });
-          return from(Promise.all(durationPromises));
+        switchMap((audioList: AudioItem[]) => this.loadAudioDurations(audioList)),
+        catchError(error => {
+          console.error('Error loading audio list:', error);
+          return of([]);
         })
       )
       .subscribe((data: AudioItem[]) => {
         this.audioList.set(data);
-        this.currentTrackIndex.set(0);
-        this.currentAudio.set(data[this.currentTrackIndex()]);
-        this.audio.src = data[this.currentTrackIndex()].url;
-        this.isAudioLoaded.set(false);
+        if (data.length > 0) {
+          this.currentTrackIndex.set(0);
+          this.audio.src = data[0].url;
+          this.isAudioLoaded.set(false);
+        }
       });
   }
-  constructor() {
 
-  }
-
-
-  ngOnDestroy(): void {
-    this.destroy$.next();
-    this.destroy$.complete();
-
-    if (this.audioPlayer()) {
-      /* const audio = this.audioPlayer().nativeElement;*/
-      this.eventListenerService.unregisterAll();
-    }
-  }
-  scrollToCurrentTrack() {
-    const container = this.trackListContainer().nativeElement;
-    const selectedTrack = container.children[this.currentTrackIndex()];
-    if (selectedTrack) {
-      selectedTrack.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    }
-  }
-  private initializeAudio(): void {
-    const audioList = this.audioList();
-    if (audioList?.length) {
-      this.currentAudio.set(audioList[0]);
-      if (this.isShuffle()) {
-        this.generateShuffleIndices();
+  private loadAudioDurations(audioList: AudioItem[]) {
+    const durationPromises = audioList.map(async (item: AudioItem) => {
+      try {
+        item.duration = await this.getAudioDuration(item.url);
+        return item;
+      } catch (error) {
+        console.warn(`Failed to load duration for ${item.title}:`, error);
+        item.duration = 0;
+        return item;
       }
-    }
+    });
+    return from(Promise.all(durationPromises));
+  }
 
+  private initializeAudioElement(): void {
     setTimeout(() => {
       if (this.audioPlayer()) {
-        //const audio = this.audioPlayer().nativeElement;
-        this.audio.volume = this.audioVolume() / 100;
-        this.isAudioAutoPlay.set(this.autoPlay());
+        this.audioPlayer().nativeElement.autoplay = this.autoPlay();
+        this.audioPlayer().nativeElement.crossOrigin = 'anonymous'; // Ensure CORS is handled
+        this.audio = this.audioPlayer().nativeElement;
 
-        this.eventListenerService.registerHandler(this.audio, 'playing', this.handlePlaying);
-        this.eventListenerService.registerHandler(this.audio, 'pause', this.handlePause);
-        this.eventListenerService.registerHandler(this.audio, 'loadeddata', this.handleLoadedData);
-        this.eventListenerService.registerHandler(this.audio, 'timeupdate', this.handleTimeUpdate);
-        this.eventListenerService.registerHandler(this.audio, 'ended', this.handleEnded);
-        this.eventListenerService.registerHandler(this.audio, 'volumechange', this.handleVolumeChange);
+        this.setupAudioProperties();
+        this.registerEventListeners();
 
         if (this.autoPlay()) {
-          this.attemptAutoplay();
+          this.handleAutoplay();
         }
       }
     }, 0);
   }
 
-  // Event handlers
+  private setupAudioProperties(): void {
+    this.audio.volume = this.audioVolume() / 100;
+    this.audio.autoplay = false; // Handle autoplay manually
+    this.audio.preload = 'metadata';
+    this.isAudioAutoPlay.set(this.autoPlay());
+  }
+
+  private registerEventListeners(): void {
+    const events = [
+      { event: 'playing', handler: this.handlePlaying },
+      { event: 'pause', handler: this.handlePause },
+      { event: 'loadeddata', handler: this.handleLoadedData },
+      { event: 'timeupdate', handler: this.handleTimeUpdate },
+      { event: 'ended', handler: this.handleEnded },
+      { event: 'volumechange', handler: this.handleVolumeChange },
+      { event: 'error', handler: this.handleError },
+      { event: 'loadstart', handler: this.handleLoadStart }
+    ];
+
+    events.forEach(({ event, handler }) => {
+      this.eventListenerService.registerHandler(this.audio, event, handler);
+    });
+  }
+
+  private async handleAutoplay(): Promise<void> {
+    if (!this.audio || !this.isAudioAutoPlay()) return;
+
+    switch (this.autoplayCapability) {
+      case 'allowed':
+        await this.attemptNormalAutoplay();
+        break;
+      case 'muted-only':
+        await this.attemptMutedAutoplay();
+        break;
+      case 'blocked':
+        this.notifyAutoplayBlocked();
+        this.audio.play();
+        break;
+    }
+  }
+
+  private async attemptNormalAutoplay(): Promise<void> {
+    try {
+      await this.audio.play();
+      this.playEvent.emit();
+    } catch (error) {
+      console.warn('Normal autoplay failed:', error);
+      await this.attemptMutedAutoplay();
+    }
+  }
+
+  private async attemptMutedAutoplay(): Promise<void> {
+    try {
+      this.audio.muted = true;
+      this.isMute.set(true);
+      await this.audio.play();
+      this.playEvent.emit();
+      this.notifyMutedAutoplay();
+    } catch (error) {
+      console.warn('Muted autoplay failed:', error);
+      this.notifyAutoplayBlocked();
+    }
+  }
+
+  private notifyMutedAutoplay(): void {
+    console.info('Audio started muted due to browser autoplay policy');
+  }
+
+  private notifyAutoplayBlocked(): void {
+    console.info('Autoplay blocked - user interaction required');
+  }
+
+  // =============================================================================
+  // AUTOPLAY MANAGEMENT
+  // =============================================================================
+
+  private async checkAutoplayCapability(): Promise<void> {
+    try {
+      const testAudio = new Audio();
+      testAudio.autoplay = this.autoPlay(); 
+      testAudio.volume = 0.1;
+      testAudio.muted = true;
+
+      await testAudio.play();
+      testAudio.pause();
+
+      // Test unmuted
+      testAudio.muted = false;
+      try {
+        await testAudio.play();
+        testAudio.pause();
+        this.autoplayCapability = 'allowed';
+      } catch {
+        this.autoplayCapability = 'muted-only';
+      }
+    } catch {
+      this.autoplayCapability = 'blocked';
+    }
+  }
+  // =============================================================================
+  // EVENT HANDLERS
+  // =============================================================================
+
   private handlePlaying = (): void => {
     this.isAudioPlaying.set(true);
     this.playEvent.emit();
@@ -159,48 +299,74 @@ export class AudioPlayerComponent {
 
   private handleLoadedData = (): void => {
     this.isAudioLoaded.set(true);
-    const duration = Math.floor(this.audioPlayer().nativeElement.duration);
+    const duration = Math.floor(this.audio.duration);
     this.totalAudioLength.set(duration);
   };
 
-  private handleEnded = (): void => {
-    this.trackEndEvent.emit();
-    if (this.isRepeat()) {
-      this.audioPlayer().nativeElement.currentTime = 0;
-      this.audioVolume.set(this.audioPlayer().nativeElement.currentTime)
-      this.play();
-      return;
-    } else {
-      this.playNext();
-    }
+  private handleLoadStart = (): void => {
+    this.isAudioLoaded.set(false);
   };
+
   private handleTimeUpdate = (): void => {
-    const currentTime = Math.floor(this.audioPlayer().nativeElement.currentTime);
+    const currentTime = Math.floor(this.audio.currentTime);
     this.currentAudioTime.set(currentTime);
     this.audioTimeUpdateChange.emit(currentTime);
   };
 
   private handleVolumeChange = (): void => {
-    const volume = Math.floor(this.audioPlayer().nativeElement.volume * 100);
+    const volume = Math.floor(this.audio.volume * 100);
     this.audioVolumeChange.emit(volume);
-
   };
 
-  // Public API methods
-  play(): void {
-    if (this.audioPlayer()) {
-      this.handleLoadedData();
+  private handleError = (event: Event): void => {
+    console.error('Audio error occurred:', event);
+    this.isAudioLoaded.set(false);
+  };
+
+  private handleEnded = (): void => {
+    this.trackEndEvent.emit();
+
+    if (this.isRepeat()) {
+      this.restartCurrentTrack();
+    } else if (this.canPlayNext()) {
+      this.playNext();
+    } else {
+      this.handlePlaylistEnd();
+    }
+  };
+
+  private restartCurrentTrack(): void {
+    this.audio.currentTime = 0;
+    this.currentAudioTime.set(0);
+    this.play();
+  }
+
+  private handlePlaylistEnd(): void {
+    this.isAudioPlaying.set(false);
+    this.currentAudioTime.set(0);
+    this.audio.currentTime = 0;
+  }
+
+
+  // =============================================================================
+  // PUBLIC PLAYBACK CONTROL METHODS
+  // =============================================================================
+
+  async play(): Promise<void> {
+    if (!this.audio) return;
+
+    try {
       this.scrollToCurrentTrack();
-      this.audioPlayer().nativeElement.play()
-        .catch(error => console.error('Error playing audio:', error));
+      await this.audio.play();
+    } catch (error) {
+      console.error('Error playing audio:', error);
     }
   }
 
   pause(): void {
-    if (this.audioPlayer()) {
-      this.audioPlayer().nativeElement.pause();
+    if (this.audio) {
+      this.audio.pause();
     }
-
   }
 
   togglePlay(): void {
@@ -208,18 +374,27 @@ export class AudioPlayerComponent {
   }
 
   toggleMute(): void {
-    if (this.audioPlayer()) {
+    if (this.audio) {
+      const newMuteState = !this.isMute();
+      this.isMute.set(newMuteState);
       this.muteEvent.emit();
-      this.isMute.set(!this.isMute());
-      this.audioPlayer().nativeElement.muted = this.isMute();
     }
   }
 
   toggleRepeat(): void {
-    if (this.audioPlayer()) {
-      this.audio.loop = !this.audio.loop;
-      this.isRepeat.set(this.audio.loop);
-      this.repeatEvent.emit();
+    const newRepeatState = !this.isRepeat();
+    this.isRepeat.set(newRepeatState);
+    this.repeatEvent.emit();
+  }
+
+  toggleShuffle(): void {
+    const newShuffleState = !this.isShuffle();
+    this.isShuffle.set(newShuffleState);
+
+    if (newShuffleState) {
+      this.enableShuffle();
+    } else {
+      this.disableShuffle();
     }
   }
 
@@ -229,41 +404,60 @@ export class AudioPlayerComponent {
     this.autoPlayChange.emit(newAutoPlayState);
 
     if (newAutoPlayState && this.isAudioLoaded() && !this.isAudioPlaying()) {
-      this.attemptAutoplay();
+      this.handleAutoplay();
     }
   }
 
-  seek(time: Event): void {
-    if (this.audioPlayer()) {
-      const input = time.target as HTMLInputElement;
-      const timeNumber = parseFloat(input.value)
-      this.audioPlayer().nativeElement.currentTime = timeNumber;
-      this.currentAudioTime.set(this.audioPlayer().nativeElement.currentTime);
-    }
-  }
+  // =============================================================================
+  // TRACK NAVIGATION METHODS
+  // =============================================================================
 
-  setVolume(volume: Event): void {
-    if (this.audioPlayer()) {
-      const input = volume.target as HTMLInputElement;
-      const volumeNumber = parseFloat(input.value);
-      this.audioPlayer().nativeElement.volume = volumeNumber / 100;
-      this.audioVolume.set(this.audioPlayer().nativeElement.volume)
-    }
-  }
   playNext(): void {
-    const audioList = this.audioList();
-    if (!audioList?.length) return;
+    if (!this.canPlayNext()) return;
 
     const nextIndex = this.getNextTrackIndex();
-    this.currentTrackIndex.set(nextIndex);
-    this.audioPlayer().nativeElement.currentTime = 0;
-    this.currentAudioTime.set(this.audioPlayer().nativeElement.currentTime);
-    this.currentAudio.set(audioList[this.currentTrackIndex()]);
-    this.audio.src = audioList[this.currentTrackIndex()].url; 
-    if (this.audio.muted) {
-      this.audio.muted = !this.audio.muted;
-      this.isMute.set(this.audio.muted);
+    this.changeTrack(nextIndex);
+  }
+
+  playPrevious(): void {
+    if (!this.canPlayPrevious()) return;
+
+    const prevIndex = this.getPreviousTrackIndex();
+    this.changeTrack(prevIndex);
+  }
+
+  playTrack(index: number): void {
+    const audioList = this.audioList();
+    if (!audioList.length || index < 0 || index >= audioList.length) return;
+
+    this.changeTrack(index);
+  }
+
+  playRandom(): void {
+    const audioList = this.audioList();
+    if (audioList.length <= 1) return;
+
+    let randomIndex: number;
+    do {
+      randomIndex = Math.floor(Math.random() * audioList.length);
+    } while (randomIndex === this.currentTrackIndex());
+
+    this.changeTrack(randomIndex);
+
+    if (this.isShuffle()) {
+      this.updateShuffleHistory(randomIndex);
     }
+  }
+
+  private changeTrack(index: number): void {
+    this.currentTrackIndex.set(index);
+    this.resetAudioState();
+
+    const currentAudio = this.currentAudio();
+    if (currentAudio) {
+      this.trackChangeEvent.emit(currentAudio);
+    }
+    this.audio.src = this.currentAudio().url;
     setTimeout(() => {
       if (this.isAudioAutoPlay()) {
         this.play();
@@ -271,27 +465,181 @@ export class AudioPlayerComponent {
     }, 50);
   }
 
-  playPrevious(): void {
-    const audioList = this.audioList();
-    if (!audioList?.length) return;
+  private resetAudioState(): void {
+    if (this.audio) {
+      this.audio.currentTime = 0;
+      this.currentAudioTime.set(0);
 
-    const prevIndex = this.getPreviousTrackIndex();
-    this.currentTrackIndex.set(prevIndex);
-    this.audioPlayer().nativeElement.currentTime = 0;
-    this.currentAudioTime.set(this.audioPlayer().nativeElement.currentTime);
-    this.currentAudio.set(audioList[this.currentTrackIndex()]);
-    this.audio.src = audioList[this.currentTrackIndex()].url; 
-    setTimeout(() => this.play(), 50);
+      if (this.audio.muted && !this.isMute()) {
+        this.audio.muted = false;
+      }
+    }
   }
 
-  playTrack(index: number): void {
-    const audioList = this.audioList();
-    if (!audioList?.length || index < 0 || index >= audioList.length) return;
+  // =============================================================================
+  // SEEK AND VOLUME CONTROLS
+  // =============================================================================
 
-    this.currentTrackIndex.set(index);
-    this.currentAudio.set(audioList[this.currentTrackIndex()]);
-    this.audio.src = audioList[this.currentTrackIndex()].url;
-    setTimeout(() => this.play(), 50);
+  seek(event: Event): void {
+    if (!this.audio) return;
+
+    const input = event.target as HTMLInputElement;
+    const time = parseFloat(input.value);
+    this.audio.currentTime = time;
+    this.currentAudioTime.set(time);
+  }
+
+  seekForward(): void {
+    if (this.audio) {
+      const newTime = Math.min(
+        this.audio.currentTime + AudioPlayerComponent.SEEK_STEP,
+        this.audio.duration
+      );
+      this.audio.currentTime = newTime;
+    }
+  }
+
+  seekBackward(): void {
+    if (this.audio) {
+      const newTime = Math.max(
+        this.audio.currentTime - AudioPlayerComponent.SEEK_STEP,
+        0
+      );
+      this.audio.currentTime = newTime;
+    }
+  }
+
+  setVolume(event: Event): void {
+    if (!this.audio) return;
+
+    const input = event.target as HTMLInputElement;
+    const volume = parseFloat(input.value);
+    this.audioVolume.set(volume);
+  }
+
+  increaseVolume(): void {
+    const newVolume = Math.min(
+      this.audioVolume() + AudioPlayerComponent.VOLUME_STEP,
+      100
+    );
+    this.audioVolume.set(newVolume);
+  }
+
+  decreaseVolume(): void {
+    const newVolume = Math.max(
+      this.audioVolume() - AudioPlayerComponent.VOLUME_STEP,
+      0
+    );
+    this.audioVolume.set(newVolume);
+  }
+
+  // =============================================================================
+  // SHUFFLE MANAGEMENT
+  // =============================================================================
+
+  private enableShuffle(): void {
+    this.playHistory = [this.currentTrackIndex()];
+    this.generateShuffleIndices();
+  }
+
+  private disableShuffle(): void {
+    this.playHistory = [this.currentTrackIndex()];
+    this.shuffledIndices = [];
+  }
+
+  private generateShuffleIndices(): void {
+    const audioList = this.audioList();
+    if (!audioList.length) return;
+
+    // Create array of all indices except current
+    const currentIndex = this.currentTrackIndex();
+    this.shuffledIndices = Array.from({ length: audioList.length }, (_, i) => i)
+      .filter(i => i !== currentIndex);
+
+    // Fisher-Yates shuffle
+    for (let i = this.shuffledIndices.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [this.shuffledIndices[i], this.shuffledIndices[j]] =
+        [this.shuffledIndices[j], this.shuffledIndices[i]];
+    }
+  }
+
+  private getNextTrackIndex(): number {
+    const audioList = this.audioList();
+    if (!audioList.length) return 0;
+
+    if (this.isShuffle()) {
+      return this.getNextShuffleIndex();
+    } else {
+      const nextIndex = this.currentTrackIndex() + 1;
+      return nextIndex >= audioList.length ? 0 : nextIndex;
+    }
+  }
+
+  private getPreviousTrackIndex(): number {
+    const audioList = this.audioList();
+    if (!audioList.length) return 0;
+
+    if (this.isShuffle()) {
+      return this.getPreviousShuffleIndex();
+    } else {
+      const prevIndex = this.currentTrackIndex() - 1;
+      return prevIndex < 0 ? audioList.length - 1 : prevIndex;
+    }
+  }
+
+  private getNextShuffleIndex(): number {
+    if (this.shuffledIndices.length === 0) {
+      this.regenerateShuffleForHistory();
+    }
+
+    const nextIndex = this.shuffledIndices.shift() || 0;
+    this.addToPlayHistory(nextIndex);
+    return nextIndex;
+  }
+
+  private getPreviousShuffleIndex(): number {
+    if (this.playHistory.length > 1) {
+      this.playHistory.pop(); // Remove current
+      return this.playHistory[this.playHistory.length - 1];
+    }
+    return this.currentTrackIndex();
+  }
+
+  private regenerateShuffleForHistory(): void {
+    this.generateShuffleIndices();
+
+    // Remove already played tracks from shuffle
+    this.playHistory.forEach(historyIndex => {
+      const shuffleIndex = this.shuffledIndices.indexOf(historyIndex);
+      if (shuffleIndex > -1) {
+        this.shuffledIndices.splice(shuffleIndex, 1);
+      }
+    });
+
+    // If all tracks played, reset history
+    if (this.shuffledIndices.length === 0) {
+      this.playHistory = [this.currentTrackIndex()];
+      this.generateShuffleIndices();
+    }
+  }
+
+  private addToPlayHistory(index: number): void {
+    this.playHistory.push(index);
+
+    // Limit history size
+    if (this.playHistory.length > AudioPlayerComponent.MAX_HISTORY_LENGTH) {
+      this.playHistory.shift();
+    }
+  }
+
+  private updateShuffleHistory(index: number): void {
+    this.addToPlayHistory(index);
+
+    const shuffleIndex = this.shuffledIndices.indexOf(index);
+    if (shuffleIndex > -1) {
+      this.shuffledIndices.splice(shuffleIndex, 1);
+    }
   }
 
   private attemptAutoplay(): void {
@@ -322,148 +670,64 @@ export class AudioPlayerComponent {
       });
   }
 
-  private generateShuffleIndices(): void {
-    const audioList = this.audioList();
-    if (!audioList?.length) return;
-
-    this.shuffledIndices = Array.from({ length: audioList.length }, (_, i) => i);
-
-    // Fisher-Yates shuffle
-    for (let i = this.shuffledIndices.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [this.shuffledIndices[i], this.shuffledIndices[j]] =
-        [this.shuffledIndices[j], this.shuffledIndices[i]];
-    }
-
-    // Remove current track from shuffle if it exists
-    const currentIndex = this.currentTrackIndex();
-    const shuffleIndex = this.shuffledIndices.indexOf(currentIndex);
-    if (shuffleIndex > -1) {
-      this.shuffledIndices.splice(shuffleIndex, 1);
-    }
-  }
-
-  private getNextTrackIndex(): number {
-    const audioList = this.audioList();
-    if (!audioList?.length) return 0;
-
-    if (this.isShuffle()) {
-      if (this.shuffledIndices.length === 0) {
-        this.generateShuffleIndices();
-
-        this.playHistory.forEach(historyIndex => {
-          const indexToRemove = this.shuffledIndices.indexOf(historyIndex);
-          if (indexToRemove > -1) {
-            this.shuffledIndices.splice(indexToRemove, 1);
-          }
-        });
-
-        if (this.shuffledIndices.length === 0) {
-          this.playHistory = [];
-          this.generateShuffleIndices();
-        }
-      }
-
-      const nextShuffleIndex = this.shuffledIndices.shift() || 0;
-      this.playHistory.push(nextShuffleIndex);
-
-      if (this.playHistory.length > audioList.length) {
-        this.playHistory.shift();
-      }
-
-      return nextShuffleIndex;
-    } else {
-      let nextIndex = this.currentTrackIndex() + 1;
-      return nextIndex >= audioList.length ? 0 : nextIndex;
-    }
-  }
-
-  private getPreviousTrackIndex(): number {
-    const audioList = this.audioList();
-    if (!audioList?.length) return 0;
-
-    if (this.isShuffle()) {
-      if (this.playHistory.length > 1) {
-        this.playHistory.pop();
-        return this.playHistory[this.playHistory.length - 1];
-      }
-      return this.currentTrackIndex();
-    } else {
-      let prevIndex = this.currentTrackIndex() - 1;
-      return prevIndex < 0 ? audioList.length - 1 : prevIndex;
-    }
-  }
-
-  playRandom(): void {
-    const audioList = this.audioList();
-    if (!audioList?.length) return;
-
-    let randomIndex: number;
-    do {
-      randomIndex = Math.floor(Math.random() * audioList.length);
-    } while (randomIndex === this.currentTrackIndex() && audioList.length > 1);
-
-    this.currentTrackIndex.set(randomIndex);
-
-    if (this.isShuffle()) {
-      this.playHistory.push(randomIndex);
-      const shuffleIndex = this.shuffledIndices.indexOf(randomIndex);
-      if (shuffleIndex > -1) {
-        this.shuffledIndices.splice(shuffleIndex, 1);
-      }
-    }
-
-    setTimeout(() => this.play(), 50);
-  }
+  // =============================================================================
+  // UTILITY METHODS
+  // =============================================================================
 
   resetShuffle(): void {
     if (!this.isShuffle()) return;
-
-    this.playHistory = [this.currentTrackIndex()];
-    this.generateShuffleIndices();
-
-    const currentIndex = this.currentTrackIndex();
-    const shuffleIndex = this.shuffledIndices.indexOf(currentIndex);
-    if (shuffleIndex > -1) {
-      this.shuffledIndices.splice(shuffleIndex, 1);
-    }
+    this.enableShuffle();
   }
 
   getRemainingShuffleTracks(): number {
     return this.shuffledIndices.length;
   }
-  readonly audioListState = computed(() => {
-    const list = this.audioList();
-    return !list || list.length === 0;
-  });
 
-  private getAudioDuration(src: string): Promise<number> {
-    const audioTmp = new Audio();
+  private scrollToCurrentTrack(): void {
+    const container = this.trackListContainer();
+    if (!container) return;
 
-    return new Promise(resolve => {
-      const onMetadata = () => {
-        resolve(Math.floor(audioTmp.duration));
+    const selectedTrack = container.nativeElement.children[this.currentTrackIndex()];
+    if (selectedTrack) {
+      selectedTrack.scrollIntoView({
+        behavior: 'smooth',
+        block: 'nearest',
+        inline: 'nearest'
+      });
+    }
+  }
+
+  private async getAudioDuration(src: string): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const audioTemp = new Audio();
+
+      const cleanup = () => {
+        this.eventListenerService.unregisterHandlers(audioTemp);
       };
 
-      this.eventListenerService.registerHandler(audioTmp, 'loadedmetadata', onMetadata);
-      audioTmp.src = src;
+      const onMetadata = () => {
+        cleanup();
+        resolve(Math.floor(audioTemp.duration || 0));
+      };
+
+      const onError = () => {
+        cleanup();
+        reject(new Error(`Failed to load audio: ${src}`));
+      };
+
+      this.eventListenerService.registerHandler(audioTemp, 'loadedmetadata', onMetadata);
+      this.eventListenerService.registerHandler(audioTemp, 'error', onError);
+
+      audioTemp.src = src;
     });
   }
 
-  getVideoDuration(src: string, obj: any) {
-    return new Promise(function (resolve) {
-      var video = document.createElement('video');
-      video.preload = 'metadata';
-      video.addEventListener('loadedmetadata', () => {
-        var event = new CustomEvent("myVideoDurationEvent", {
-          detail: {
-            duration: video.duration,
-          }
-        });
-        obj['duration'] = Math.floor(video.duration);
-      })
-      video.src = src;
+  private cleanup(): void {
+    this.destroy$.next();
+    this.destroy$.complete();
+
+    if (this.audio) {
+      this.eventListenerService.unregisterAll();
     }
-    );
   }
 }
