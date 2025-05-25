@@ -1,4 +1,4 @@
-import { Component, ElementRef, output, signal, viewChild, effect, OnInit, OnDestroy, inject } from '@angular/core';
+import { Component, ElementRef, output, signal, viewChild, effect, OnInit, OnDestroy, inject, computed } from '@angular/core';
 import { Subject, switchMap, takeUntil, map, from } from 'rxjs';
 import { NgFor, NgIf } from '@angular/common';
 import { AudioItem, AudioService } from '../services/audio.service';
@@ -92,10 +92,12 @@ export class AudioPlayerComponent {
         this.audioList.set(data);
         this.currentTrackIndex.set(0);
         this.currentAudio.set(data[this.currentTrackIndex()]);
+        this.audio.src = data[this.currentTrackIndex()].url;
         this.isAudioLoaded.set(false);
       });
   }
   constructor() {
+
   }
 
 
@@ -257,6 +259,7 @@ export class AudioPlayerComponent {
     this.audioPlayer().nativeElement.currentTime = 0;
     this.currentAudioTime.set(this.audioPlayer().nativeElement.currentTime);
     this.currentAudio.set(audioList[this.currentTrackIndex()]);
+    this.audio.src = audioList[this.currentTrackIndex()].url; 
     if (this.audio.muted) {
       this.audio.muted = !this.audio.muted;
       this.isMute.set(this.audio.muted);
@@ -277,6 +280,7 @@ export class AudioPlayerComponent {
     this.audioPlayer().nativeElement.currentTime = 0;
     this.currentAudioTime.set(this.audioPlayer().nativeElement.currentTime);
     this.currentAudio.set(audioList[this.currentTrackIndex()]);
+    this.audio.src = audioList[this.currentTrackIndex()].url; 
     setTimeout(() => this.play(), 50);
   }
 
@@ -286,6 +290,7 @@ export class AudioPlayerComponent {
 
     this.currentTrackIndex.set(index);
     this.currentAudio.set(audioList[this.currentTrackIndex()]);
+    this.audio.src = audioList[this.currentTrackIndex()].url;
     setTimeout(() => this.play(), 50);
   }
 
@@ -427,24 +432,11 @@ export class AudioPlayerComponent {
   getRemainingShuffleTracks(): number {
     return this.shuffledIndices.length;
   }
-
-  get audioListState(): boolean {
-    const list = this.audioList(); // Cache the value
+  readonly audioListState = computed(() => {
+    const list = this.audioList();
     return !list || list.length === 0;
-  }
-  //private getAudioDuration(src: string): Promise<number> {
-  //  return new Promise(resolve => {
-  //    const audio = new Audio();
+  });
 
-  //    const onLoadedMetadata = () => {
-  //      this.eventListenerService.unregisterHandlers(this.audio); // cleanup after use
-  //      resolve(Math.floor(audio.duration));
-  //    };
-
-  //    this.eventListenerService.registerHandler(this.audio, 'loadedmetadata', onLoadedMetadata);
-  //    audio.src = src;
-  //  });
-  //}
   private getAudioDuration(src: string): Promise<number> {
     const audioTmp = new Audio();
 

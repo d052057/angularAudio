@@ -1,5 +1,5 @@
 <div class="container py-3" [@fadeInOut]>
-  <audio controls #AngAudioPlayer [src]="currentAudio()?.url"></audio>
+  <audio controls #AngAudioPlayer></audio>
   <div class="card shadow-sm">
     <div class="card-body">
       <!-- Track info -->
@@ -28,7 +28,7 @@
 
         <button class="btn btn-outline-secondary rounded-circle"
                 (click)="playPrevious()"
-                [disabled]="audioListState"
+                [disabled]="audioListState()"
                 title="Previous">
           <i class="bi bi-skip-start-fill"></i>
         </button>
@@ -42,7 +42,7 @@
 
         <button class="btn btn-outline-secondary rounded-circle"
                 (click)="playNext()"
-                [disabled]="audioListState"
+                [disabled]="audioListState()"
                 title="Next">
           <i class="bi bi-skip-end-fill"></i>
         </button>
@@ -71,7 +71,7 @@
 
         <button class="btn btn-outline-secondary rounded-circle"
                 (click)="playRandom()"
-                [disabled]="audioListState"
+                [disabled]="audioListState()"
                 title="Play Random">
           <i class="bi bi-shuffle"></i>
         </button>
@@ -95,7 +95,7 @@
                 [class.active]="i === currentTrackIndex()"
                 (click)="playTrack(i)">
           <span class="me-2">{{ i + 1 }}.</span>
-          <span class="flex-grow-1 text-start">{{ item.title || 'Untitled track' }}</span>
+          <span class="flex-grow-1 text-start">{{ item?.title || 'Untitled track' }}</span>
           <span class="badge bg-secondary rounded-pill">{{ item.duration | timeConversion }}</span>
         </button>
       </div>
